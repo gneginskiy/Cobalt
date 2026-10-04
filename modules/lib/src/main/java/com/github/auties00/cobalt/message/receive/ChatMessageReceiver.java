@@ -282,10 +282,42 @@ final class ChatMessageReceiver extends MessageReceiver<ChatMessageInfo> {
         }
 
         maybeDecryptPollVote(effectiveContainer, stanza);
+        learnLidMappings(stanza);
 
         var info = buildChatMessageInfo(stanza, chatJid, effectiveContainer);
         emitReceiveTelemetry(stanza, chatJid, effectiveContainer);
         return info;
+    }
+
+    /**
+     * frosto: keeps the phone number / LID pairs the stanza names. WhatsApp addresses more and more
+     * senders by their LID and names the phone number beside it ({@code sender_pn},
+     * {@code participant_pn}, or the LID beside a phone sender); without the pair the LID cannot be
+     * turned back into the number that the address book and the CRM know. Best effort: a pair that
+     * cannot be stored never fails the message.
+     *
+     * @param stanza the parsed receive stanza
+     */
+    private void learnLidMappings(MessageReceiveStanza stanza) {
+        try {
+            learnLidMapping(stanza.senderJid(), stanza.senderPn().orElse(null), stanza.senderLid().orElse(null));
+            stanza.participantPn().ifPresent(pn -> stanza.participantLid()
+                    .ifPresent(lid -> learnLidMapping(lid, pn, null)));
+        } catch (RuntimeException e) {
+            if (Log.WARNING) LOGGER.log(Level.WARNING, "LID pair of {0} not kept: {1}", stanza.id(), e.toString());
+        }
+    }
+
+    private void learnLidMapping(Jid sender, Jid pn, Jid lid) {
+        if (sender == null) {
+            return;
+        }
+        var user = sender.toUserJid();
+        if (user.hasLidServer() && pn != null) {
+            store.contactStore().registerLidMapping(pn.toUserJid(), user);
+        } else if (user.hasUserServer() && lid != null) {
+            store.contactStore().registerLidMapping(user, lid.toUserJid());
+        }
     }
 
     /**
