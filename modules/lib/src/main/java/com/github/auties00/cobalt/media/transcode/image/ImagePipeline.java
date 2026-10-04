@@ -4,6 +4,7 @@ import com.github.auties00.cobalt.exception.linked.WhatsAppMediaException;
 import com.github.auties00.cobalt.telemetry.log.Log;
 import com.github.auties00.cobalt.media.MediaPayload;
 import com.github.auties00.cobalt.util.ffmpeg.AVCodecContext;
+import com.github.auties00.cobalt.util.ffmpeg.AVRational;
 import com.github.auties00.cobalt.util.ffmpeg.AVCodecParameters;
 import com.github.auties00.cobalt.util.ffmpeg.AVDictionaryEntry;
 import com.github.auties00.cobalt.util.ffmpeg.AVFilterContext;
@@ -298,7 +299,10 @@ public final class ImagePipeline {
                 Ffmpeg.avfilter_inout_free(outputsPp);
             }
             FFmpegError.check("av_buffersrc_add_frame_flags",
-                    Ffmpeg.av_buffersrc_add_frame_flags(srcCtx, decoded.frame, 0));
+                    // KEEP_REF: the decoded frame is scaled twice (the image, then its thumbnail); with 0
+                    // the buffer source takes it and the second pass gets an empty frame (0x0)
+                    Ffmpeg.av_buffersrc_add_frame_flags(srcCtx, decoded.frame,
+                            Ffmpeg.AV_BUFFERSRC_FLAG_KEEP_REF()));
             var outFrame = allocFrame();
             var got = Ffmpeg.av_buffersink_get_frame(sinkCtx, outFrame);
             if (got < 0) {
@@ -394,6 +398,14 @@ public final class ImagePipeline {
             AVCodecContext.width(ctx, w);
             AVCodecContext.height(ctx, h);
             AVCodecContext.pix_fmt(ctx, OUTPUT_PIX_FMT);
+            // a square pixel aspect: only then the mjpeg encoder writes the JFIF (APP0) header, which
+            // JpegCleaner (WhatsApp Web's cleanJPEG) requires before the image data
+            try (var sarArena = Arena.ofConfined()) {
+                var sar = sarArena.allocate(AVRational.layout());
+                AVRational.num(sar, 1);
+                AVRational.den(sar, 1);
+                AVCodecContext.sample_aspect_ratio(ctx, sar);
+            }
             try (var local = Arena.ofConfined()) {
                 var tb = local.allocate(8);
                 tb.set(ValueLayout.JAVA_INT, 0L, 1);
@@ -494,18 +506,18 @@ public final class ImagePipeline {
      */
     private static int readOrientation(MemorySegment stream) {
         var metadata = AVStream.metadata(stream);
-        if (metadata == null || metadata == MemorySegment.NULL) {
+        if (metadata == null || metadata.address() == 0) {
             return 0;
         }
         try (var arena = Arena.ofConfined()) {
             var entry = Ffmpeg.av_dict_get(metadata, arena.allocateFrom("rotate"),
                     MemorySegment.NULL, 0);
-            if (entry == null || entry == MemorySegment.NULL) {
+            if (entry == null || entry.address() == 0) {
                 return 0;
             }
             var entryTyped = entry.reinterpret(AVDictionaryEntry.layout().byteSize());
             var valuePtr = AVDictionaryEntry.value(entryTyped);
-            if (valuePtr == null || valuePtr == MemorySegment.NULL) {
+            if (valuePtr == null || valuePtr.address() == 0) {
                 return 0;
             }
             var value = valuePtr.reinterpret(Long.MAX_VALUE).getString(0L);
@@ -547,16 +559,21 @@ public final class ImagePipeline {
         var frame = MemorySegment.NULL;
         var packet = MemorySegment.NULL;
         try {
-            formatCtx = FFmpegError.requireNonNull("avformat_alloc_context",
-                    Ffmpeg.avformat_alloc_context());
-            AVFormatContext.pb(formatCtx, bridge.ioContext());
+            // the native build has no piped image demuxers (--enable-demuxer=jpeg_pipe,webp_pipe are not
+            // ffmpeg 7 names: image_jpeg_pipe, image_webp_pipe), so a custom AVIO source is never
+            // recognised; the image2 demuxer is there and picks the codec by the file's extension
+            var source = SourceFile.of(channel);
+            formatCtx = MemorySegment.NULL;
             var formatPp = arena.allocate(ValueLayout.ADDRESS);
-            formatPp.set(ValueLayout.ADDRESS, 0L, formatCtx);
-            FFmpegError.check("avformat_open_input",
-                    Ffmpeg.avformat_open_input(formatPp, MemorySegment.NULL,
-                            MemorySegment.NULL, MemorySegment.NULL));
-            formatCtx = formatPp.get(ValueLayout.ADDRESS, 0L)
-                    .reinterpret(AVFormatContext.layout().byteSize());
+            formatPp.set(ValueLayout.ADDRESS, 0L, MemorySegment.NULL);
+            var opened = Ffmpeg.avformat_open_input(formatPp, arena.allocateFrom(source.toString()),
+                    MemorySegment.NULL, MemorySegment.NULL);
+            SourceFile.delete(source);
+            // on failure avformat_open_input frees the user-supplied context and nulls *ps: read it
+            // back before checking, or freeOnFailure closes freed memory (SIGSEGV, issue #690)
+            formatCtx = formatPp.get(ValueLayout.ADDRESS, 0L);
+            FFmpegError.check("avformat_open_input", opened);
+            formatCtx = formatCtx.reinterpret(AVFormatContext.layout().byteSize());
             FFmpegError.check("avformat_find_stream_info",
                     Ffmpeg.avformat_find_stream_info(formatCtx, MemorySegment.NULL));
             var streamIndex = pickVideoStream(formatCtx);
@@ -667,7 +684,7 @@ public final class ImagePipeline {
      * @param frame the frame pointer to free; {@code NULL} is allowed
      */
     private static void freeFrame(MemorySegment frame) {
-        if (frame == null || frame == MemorySegment.NULL) {
+        if (frame == null || frame.address() == 0) {
             return;
         }
         try (var local = Arena.ofConfined()) {
@@ -692,7 +709,7 @@ public final class ImagePipeline {
     private static void freeOnFailure(MemorySegment formatCtx, MemorySegment codecCtx,
                                        MemorySegment frame, MemorySegment packet,
                                        AvioReadBuffer bridge) {
-        if (packet != null && packet != MemorySegment.NULL) {
+        if (packet != null && packet.address() != 0) {
             try (var local = Arena.ofConfined()) {
                 var pp = local.allocate(ValueLayout.ADDRESS);
                 pp.set(ValueLayout.ADDRESS, 0L, packet);
@@ -700,14 +717,14 @@ public final class ImagePipeline {
             }
         }
         freeFrame(frame);
-        if (codecCtx != null && codecCtx != MemorySegment.NULL) {
+        if (codecCtx != null && codecCtx.address() != 0) {
             try (var local = Arena.ofConfined()) {
                 var pp = local.allocate(ValueLayout.ADDRESS);
                 pp.set(ValueLayout.ADDRESS, 0L, codecCtx);
                 Ffmpeg.avcodec_free_context(pp);
             }
         }
-        if (formatCtx != null && formatCtx != MemorySegment.NULL) {
+        if (formatCtx != null && formatCtx.address() != 0) {
             try (var local = Arena.ofConfined()) {
                 var pp = local.allocate(ValueLayout.ADDRESS);
                 pp.set(ValueLayout.ADDRESS, 0L, formatCtx);
@@ -855,21 +872,21 @@ public final class ImagePipeline {
         @Override
         public void close() {
             try (var local = Arena.ofConfined()) {
-                if (packet != null && packet != MemorySegment.NULL) {
+                if (packet != null && packet.address() != 0) {
                     var pp = local.allocate(ValueLayout.ADDRESS);
                     pp.set(ValueLayout.ADDRESS, 0L, packet);
                     Ffmpeg.av_packet_free(pp);
                 }
             }
             freeFrame(frame);
-            if (codecCtx != null && codecCtx != MemorySegment.NULL) {
+            if (codecCtx != null && codecCtx.address() != 0) {
                 try (var local = Arena.ofConfined()) {
                     var pp = local.allocate(ValueLayout.ADDRESS);
                     pp.set(ValueLayout.ADDRESS, 0L, codecCtx);
                     Ffmpeg.avcodec_free_context(pp);
                 }
             }
-            if (formatCtx != null && formatCtx != MemorySegment.NULL) {
+            if (formatCtx != null && formatCtx.address() != 0) {
                 try (var local = Arena.ofConfined()) {
                     var pp = local.allocate(ValueLayout.ADDRESS);
                     pp.set(ValueLayout.ADDRESS, 0L, formatCtx);
@@ -877,6 +894,46 @@ public final class ImagePipeline {
                 }
             }
             bridge.close();
+        }
+    }
+
+    /** The source copied to a temp file named by its content (.jpg, .png, .webp), for image2. */
+    private static final class SourceFile {
+        private SourceFile() {}
+
+        static java.nio.file.Path of(SeekableByteChannel channel) {
+            try {
+                channel.position(0);
+                var head = java.nio.ByteBuffer.allocate(12);
+                channel.read(head);
+                var b = head.array();
+                var ext = (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xD8 ? ".jpg"
+                        : (b[0] & 0xFF) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G' ? ".png"
+                        : b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' && b[8] == 'W' ? ".webp"
+                        : ".jpg";
+                var file = java.nio.file.Files.createTempFile("cobalt-image", ext);
+                channel.position(0);
+                try (var out = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.WRITE)) {
+                    var buffer = java.nio.ByteBuffer.allocate(64 * 1024);
+                    while (channel.read(buffer) > 0) {
+                        buffer.flip();
+                        while (buffer.hasRemaining()) out.write(buffer);
+                        buffer.clear();
+                    }
+                }
+                channel.position(0);
+                return file;
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }
+
+        static void delete(java.nio.file.Path file) {
+            try {
+                java.nio.file.Files.deleteIfExists(file); // ffmpeg keeps its descriptor open
+            } catch (java.io.IOException ignored) {
+                // a temp file
+            }
         }
     }
 }

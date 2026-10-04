@@ -41,7 +41,9 @@ public final class JpegCleaner {
     /**
      * Length in bytes of the synthetic JFIF APP0 header emitted before any retained segment.
      */
-    private static final int JFIF_HEADER_LENGTH = 18;
+    // SOI (2) + APP0 marker (2) + its length field 16: length (2), "JFIF\0" (5), version (2), units (1), densities
+    // (4), thumbnail size (2) - 20 in all; 18 left the thumbnail size out and shifted every segment after it
+    private static final int JFIF_HEADER_LENGTH = 20;
 
     /**
      * Number of bytes a marker takes on the wire.
@@ -233,7 +235,8 @@ public final class JpegCleaner {
             throw new WhatsAppMediaException.Processing("SOI marker not at the start of the file");
         }
         var currentMarker = -1;
-        while (input.hasRemaining()) {
+        // a marker found at the end of the SOS stream (EOI: the last two bytes) is still to be handled
+        while (currentMarker >= 0 || input.hasRemaining()) {
             if (currentMarker < 0) {
                 var prefix = readUnsigned8(input);
                 if (prefix != MARKER_PREFIX) {
@@ -360,7 +363,8 @@ public final class JpegCleaner {
             throw new WhatsAppMediaException.Processing("No EOI tag found");
         }
         var jfifPrefix = buildJfifPrefix(props);
-        var body = output.toByteArray();
+        // the bytes written, not the whole backing array (toByteArray is overridden to hand it out)
+        var body = java.util.Arrays.copyOf(output.toByteArray(), output.size());
         var result = new byte[jfifPrefix.length + body.length];
         System.arraycopy(jfifPrefix, 0, result, 0, jfifPrefix.length);
         System.arraycopy(body, 0, result, jfifPrefix.length, body.length);
@@ -442,6 +446,8 @@ public final class JpegCleaner {
         buf.put((byte) props.densityUnits);
         buf.putShort((short) props.xDensity);
         buf.putShort((short) props.yDensity);
+        buf.put((byte) 0); // no thumbnail: width
+        buf.put((byte) 0); // no thumbnail: height
         return prefix;
     }
 
