@@ -590,7 +590,7 @@ public final class MessageReceiptStreamHandler extends SocketStreamHandler.Concu
 
         var deviceId = Math.max(requester.device(), 0);
         if (!isDeviceKnown(requester, deviceId)) {
-            if (Log.DEBUG) LOGGER.log(Level.DEBUG, "device {0} not found for {1}", deviceId, requester);
+            LOGGER.log(Level.WARNING, "retry of {0} from {1}: device {2} unknown, not re-sent (frosto)", originalId, requester, deviceId);
             var offline = stanza.hasAttribute("offline");
             emitRetryFromUnknownDevice(deviceId, offline);
             return;
@@ -603,9 +603,11 @@ public final class MessageReceiptStreamHandler extends SocketStreamHandler.Concu
 
         var message = findRetryMessage(from, participant, originalId);
         if (message == null) {
+            LOGGER.log(Level.WARNING, "retry #{0} of {1} from {2}: no such message here, not re-sent (frosto)", retryCount, originalId, requester);
             emitRetryReject(requester, from, retryCount, null, RetryRejectReason.MESSAGE_NOT_EXIST);
             return;
         }
+        LOGGER.log(Level.INFO, "retry #{0} of {1} from {2}: re-sending (frosto)", retryCount, originalId, requester);
         if (!message.key().fromMe()) {
             emitRetryReject(requester, from, retryCount, message, RetryRejectReason.OTHER);
             return;
@@ -654,20 +656,7 @@ public final class MessageReceiptStreamHandler extends SocketStreamHandler.Concu
             exports = "getTargetChat",
             adaptation = WhatsAppAdaptation.ADAPTED)
     private LinkedMessageInfo findRetryMessage(Jid provider, Jid participant, String id) {
-        var direct = whatsapp.store().chatStore().findMessageById(provider, id)
-                .map(LinkedMessageInfo.class::cast)
-                .orElse(null);
-        if (direct != null) {
-            return direct;
-        }
-
-        if (participant == null || provider == null || !provider.hasBroadcastServer() || provider.isStatusBroadcastAccount()) {
-            return null;
-        }
-
-        return whatsapp.store().chatStore().findMessageById(participant.toUserJid(), id)
-                .map(LinkedMessageInfo.class::cast)
-                .orElse(null);
+        return RetryMessageLookup.find(whatsapp.store().chatStore(), provider, participant, id); // frosto
     }
 
     /**
