@@ -369,6 +369,15 @@ public final class Linkify {
     }
 
     /**
+     * The place of a regex group in the components array (frosto): the array has no place for
+     * {@link #GROUP_TLD}, so the groups after it sit one place lower than {@code group - GROUP_SCHEME}
+     * (that read the query as the path - "lastComponent is null" for a link with a path only).
+     */
+    private static int slot(int group) {
+        return group < GROUP_TLD ? group - GROUP_SCHEME : group - GROUP_SCHEME - 1;
+    }
+
+    /**
      * Returns every URL detected in {@code text}, in order of appearance.
      *
      * <p>Returns the empty list for a {@code null} {@code text} and when no candidate TLD
@@ -567,12 +576,12 @@ public final class Linkify {
         }
         var a = fullMatch;
         if (lastComponentGroup != 0) {
-            var lastComponent = components[lastComponentGroup - GROUP_SCHEME];
+            var lastComponent = components[slot(lastComponentGroup)];
             var probe = matchStart + preLength - 1;
             if (lastComponent.endsWith("_") && probe >= 0 && probe < a.length() && a.charAt(probe) == '_') {
                 a = a.substring(0, a.length() - 1);
                 lastComponent = lastComponent.substring(0, lastComponent.length() - 1);
-                components[lastComponentGroup - GROUP_SCHEME] = lastComponent;
+                components[slot(lastComponentGroup)] = lastComponent;
             }
             var pending = new ArrayDeque<Integer>();
             var expectedCloser = 0;
@@ -602,7 +611,7 @@ public final class Linkify {
                         if (g == GROUP_TLD) {
                             continue;
                         }
-                        var part = components[g - GROUP_SCHEME];
+                        var part = components[slot(g)];
                         if (part != null && !part.isEmpty()) {
                             rebuilt.append(part);
                         }
