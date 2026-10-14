@@ -32,9 +32,23 @@ public final class RetryMessageLookup {
             return direct;
         }
         if (participant != null && provider != null && provider.hasBroadcastServer() && !provider.isStatusBroadcastAccount()) {
-            return chats.findMessageById(participant.toUserJid(), id)
+            var broadcast = chats.findMessageById(participant.toUserJid(), id)
                     .map(LinkedMessageInfo.class::cast)
                     .orElse(null);
+            if (broadcast != null) {
+                return broadcast;
+            }
+        }
+        return anyChat(chats, id);
+    }
+
+    /** The message with this id in any chat: the requester's other address (LID or phone number). */
+    private static LinkedMessageInfo anyChat(LinkedWhatsAppChatStore chats, String id) {
+        for (var chat : chats.chats()) {
+            var found = chats.findMessageById(chat, id).orElse(null);
+            if (found != null) {
+                return found;
+            }
         }
         return null;
     }
